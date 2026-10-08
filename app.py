@@ -12,7 +12,7 @@ client = genai.Client(
 )
 
 MODEL = "gemini-3.8-flash"
-TTS_MODEL = "gemini-3.8-flash-lite-tts"
+TTS_MODEL = "gemini-3.8-flash-tts"
 
 
 @app.route("/")
