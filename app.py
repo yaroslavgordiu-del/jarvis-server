@@ -1,6 +1,7 @@
 import os
 import tempfile
 import base64
+import gc
 
 from flask import Flask, request, jsonify, Response
 from google import genai
@@ -23,10 +24,18 @@ def home():
 @app.route("/voice", methods=["POST"])
 def voice():
 
-    try:
-        audio = request.data
+    audio_path = None
 
-        print("Received audio:", len(audio), "bytes")
+    try:
+        # --------------------------------
+        # RECEIVE WAV
+        # --------------------------------
+
+        audio = request.get_data(cache=False)
+
+        size = len(audio)
+
+        print("Received audio:", size, "bytes", flush=True)
 
         if not audio:
             return jsonify({
@@ -34,28 +43,43 @@ def voice():
                 "error": "No audio received"
             }), 400
 
+        # --------------------------------
+        # SAVE TEMP FILE
+        # --------------------------------
+
         with tempfile.NamedTemporaryFile(
             suffix=".wav",
             delete=False
         ) as f:
-            f.write(audio)
+
             audio_path = f.name
+            f.write(audio)
 
-        try:
+        # звільняємо великий об'єкт
+        del audio
+        gc.collect()
 
-            # -------------------------
-            # VOICE -> GEMINI
-            # -------------------------
+        print("WAV SAVED:", audio_path, flush=True)
 
-            uploaded_file = client.files.upload(
-                file=audio_path
-            )
+        # --------------------------------
+        # UPLOAD WAV TO GEMINI
+        # --------------------------------
 
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=[
-                    uploaded_file,
-                    """
+        uploaded_file = client.files.upload(
+            file=audio_path
+        )
+
+        print("AUDIO UPLOADED TO GEMINI", flush=True)
+
+        # --------------------------------
+        # VOICE -> TEXT/ANSWER
+        # --------------------------------
+
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=[
+                uploaded_file,
+                """
 Ти — Джарвіс, домашній голосовий AI-помічник.
 
 Користувач говорить українською.
@@ -71,66 +95,102 @@ def voice():
 Якщо нічого не почув:
 Не почув. Повтори, будь ласка.
 """
+            ]
+        )
+
+        answer = (response.text or "").strip()
+
+        print("GEMINI ANSWER:", answer, flush=True)
+
+        # звільняємо об'єкти Gemini перед TTS
+        del response
+        del uploaded_file
+        gc.collect()
+
+        if not answer:
+            return jsonify({
+                "ok": False,
+                "error": "Empty Gemini answer"
+            }), 500
+
+        # --------------------------------
+        # TEXT -> VOICE
+        # --------------------------------
+
+        print("START TTS", flush=True)
+
+        tts = client.interactions.create(
+            model=TTS_MODEL,
+            input=answer,
+            response_format={
+                "type": "audio"
+            },
+            generation_config={
+                "speech_config": [
+                    {
+                        "voice": "Kore"
+                    }
                 ]
-            )
+            }
+        )
 
-            answer = response.text.strip()
+        print("TTS GENERATED", flush=True)
 
-            print("GEMINI:", answer)
+        audio_data = tts.output_audio.data
 
-            # -------------------------
-            # TEXT -> VOICE
-            # -------------------------
+        audio_out = base64.b64decode(audio_data)
 
-            tts = client.interactions.create(
-                model=TTS_MODEL,
-                input=answer,
-                response_format={
-                    "type": "audio"
-                },
-                generation_config={
-                    "speech_config": [
-                        {
-                            "voice": "Kore"
-                        }
-                    ]
-                }
-            )
+        print(
+            "TTS AUDIO:",
+            len(audio_out),
+            "bytes",
+            flush=True
+        )
 
-            audio_out = base64.b64decode(
-                tts.output_audio.data
-            )
+        # --------------------------------
+        # RETURN AUDIO TO ESP32
+        # --------------------------------
 
-            print(
-                "TTS AUDIO:",
-                len(audio_out),
-                "bytes"
-            )
-
-            # Повертаємо WAV назад ESP32
-            return Response(
-                audio_out,
-                mimetype="audio/wav"
-            )
-
-        finally:
-
-            try:
-                os.remove(audio_path)
-            except:
-                pass
+        return Response(
+            audio_out,
+            mimetype="audio/wav"
+        )
 
     except Exception as e:
 
-        print("ERROR:", repr(e))
+        print(
+            "ERROR:",
+            repr(e),
+            flush=True
+        )
 
         return jsonify({
             "ok": False,
             "error": str(e)
         }), 500
 
+    finally:
+
+        # --------------------------------
+        # DELETE TEMP WAV
+        # --------------------------------
+
+        if audio_path:
+
+            try:
+                os.remove(audio_path)
+                print(
+                    "TEMP WAV DELETED",
+                    flush=True
+                )
+            except Exception:
+                pass
+
+        gc.collect()
+
 
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
         port=10000
