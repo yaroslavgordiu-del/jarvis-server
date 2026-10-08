@@ -1,15 +1,18 @@
 import os
 import tempfile
+import base64
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from google import genai
 
 app = Flask(__name__)
 
-# Gemini
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+client = genai.Client(
+    api_key=os.environ.get("GEMINI_API_KEY")
+)
 
 MODEL = "gemini-3.8-flash"
+TTS_MODEL = "gemini-3.8-flash-lite-tts"
 
 
 @app.route("/")
@@ -19,6 +22,7 @@ def home():
 
 @app.route("/voice", methods=["POST"])
 def voice():
+
     try:
         audio = request.data
 
@@ -30,7 +34,6 @@ def voice():
                 "error": "No audio received"
             }), 400
 
-        # Тимчасово зберігаємо WAV
         with tempfile.NamedTemporaryFile(
             suffix=".wav",
             delete=False
@@ -39,13 +42,15 @@ def voice():
             audio_path = f.name
 
         try:
-            # Завантажуємо аудіо в Gemini
+
+            # -------------------------
+            # VOICE -> GEMINI
+            # -------------------------
+
             uploaded_file = client.files.upload(
                 file=audio_path
             )
 
-            # Gemini одночасно слухає голос
-            # і формує відповідь українською.
             response = client.models.generate_content(
                 model=MODEL,
                 contents=[
@@ -53,16 +58,18 @@ def voice():
                     """
 Ти — Джарвіс, домашній голосовий AI-помічник.
 
-Користувач говорить українською мовою.
-Спочатку точно зрозумій, що він сказав.
-Потім дай коротку, корисну відповідь українською.
+Користувач говорить українською.
+
+Зрозумій його запит і дай коротку корисну відповідь українською.
+
+Відповідь повинна бути короткою,
+бо її буде озвучено голосом.
 
 Не описуй аудіо.
-Не пояснюй, що ти аналізуєш аудіофайл.
-Відповідай без зайвих слів.
+Не говори про те, що ти аналізуєш файл.
 
-Якщо голос нерозбірливий, напиши:
-"Не почув. Повтори, будь ласка."
+Якщо нічого не почув:
+Не почув. Повтори, будь ласка.
 """
                 ]
             )
@@ -71,21 +78,50 @@ def voice():
 
             print("GEMINI:", answer)
 
-            return jsonify({
-                "ok": True,
-                "message": "VOICE PROCESSED",
-                "answer": answer,
-                "size": len(audio)
-            })
+            # -------------------------
+            # TEXT -> VOICE
+            # -------------------------
+
+            tts = client.interactions.create(
+                model=TTS_MODEL,
+                input=answer,
+                response_format={
+                    "type": "audio"
+                },
+                generation_config={
+                    "speech_config": [
+                        {
+                            "voice": "Kore"
+                        }
+                    ]
+                }
+            )
+
+            audio_out = base64.b64decode(
+                tts.output_audio.data
+            )
+
+            print(
+                "TTS AUDIO:",
+                len(audio_out),
+                "bytes"
+            )
+
+            # Повертаємо WAV назад ESP32
+            return Response(
+                audio_out,
+                mimetype="audio/wav"
+            )
 
         finally:
-            # Видаляємо тимчасовий WAV
+
             try:
                 os.remove(audio_path)
-            except Exception:
+            except:
                 pass
 
     except Exception as e:
+
         print("ERROR:", repr(e))
 
         return jsonify({
