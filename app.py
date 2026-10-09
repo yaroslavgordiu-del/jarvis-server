@@ -1,306 +1,256 @@
 import os
+import re
 import time
 import base64
 import logging
 from collections import deque
+from threading import Lock
 
+import requests
 from flask import Flask, request, jsonify, Response
 from google import genai
 from google.genai import types
 
-# =====================================================
-# JARVIS SERVER
-# =====================================================
-
+# Jarvis server for ESP32-S3. Required Render variable: GEMINI_API_KEY
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("jarvis")
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
-
 if not API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing")
+    raise RuntimeError("GEMINI_API_KEY is missing in Render Environment Variables")
 
 client = genai.Client(api_key=API_KEY)
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
+TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Charon")
 
-# Fast model first, with fallbacks.
-TEXT_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-]
-
-TTS_MODELS = [
-    "gemini-3.8-flash-lite-tts",
-    "gemini-3.8-flash-tts",
-]
-
-# Short conversation memory for this single Jarvis device.
-history = deque(maxlen=8)
+# Short-term conversation memory; it resets when Render restarts the service.
+history = deque(maxlen=12)
+history_lock = Lock()
 
 SYSTEM_PROMPT = """
 Ти — Jarvis, розумний домашній голосовий помічник.
-
-Правила спілкування:
-- Відповідай українською, якщо користувач говорить українською.
-- Спілкуйся природно, дружньо та впевнено.
-- Не повторюй запитання користувача без потреби.
-- На прості запитання відповідай коротко.
-- На складні запитання пояснюй докладніше.
-- Враховуй попередні репліки, якщо вони стосуються поточного питання.
-- Не вигадуй актуальну погоду, новини, ціни або інші дані.
-- Якщо не знаєш відповіді, чесно скажи про це.
-- Не розповідай про аналіз аудіофайлів і внутрішню технічну роботу.
-- Формулюй відповідь так, щоб її було приємно слухати через динамік.
+Відповідай українською, якщо користувач говорить українською.
+Спілкуйся природно, доброзичливо та впевнено.
+Відповідай саме на запитання, не повторюй його замість відповіді.
+На прості запитання відповідай коротко, на складні — достатньо докладно.
+Враховуй попередні репліки з історії розмови.
+Для актуальних фактів, новин, законів, подій, цін, розкладів та іншої мінливої інформації
+використовуй Google Search, якщо він доступний. Не вигадуй актуальних даних.
+Якщо пошук не дав надійної відповіді, чесно скажи про це.
+Відповідь призначена для озвучення через маленький динамік: не використовуй Markdown-таблиці,
+URL, довгі списки чи технічні пояснення. Якщо запит нерозбірливий — попроси повторити.
 """
 
-# =====================================================
-# RETRIES
-# =====================================================
-
-def is_temporary_error(error):
-    message = str(error).upper()
-
-    markers = [
-        "503",
-        "UNAVAILABLE",
-        "HIGH DEMAND",
-        "429",
-        "RESOURCE_EXHAUSTED",
-        "TOO MANY REQUESTS",
-        "500",
-        "INTERNAL SERVER ERROR",
-        "502",
-        "BAD GATEWAY",
-        "504",
-        "DEADLINE EXCEEDED",
-        "TIMED OUT",
-        "TIMEOUT",
-    ]
-
-    return any(marker in message for marker in markers)
+WEATHER_WORDS = ("погод", "температур", "дощ", "сніг", "вітер", "прогноз", "weather", "temperature", "rain", "snow", "wind")
+CITY_ALIASES = {
+    "кривому розі": "Кривий Ріг", "кривой рог": "Кривий Ріг", "кривий ріг": "Кривий Ріг",
+    "києві": "Київ", "киеве": "Київ", "київ": "Київ", "киев": "Київ",
+    "харкові": "Харків", "харькове": "Харків", "харків": "Харків",
+    "одесі": "Одеса", "одессе": "Одеса", "одеса": "Одеса",
+    "львові": "Львів", "львове": "Львів", "львів": "Львів",
+    "дніпрі": "Дніпро", "днепре": "Дніпро", "дніпро": "Дніпро",
+    "запоріжжі": "Запоріжжя", "запорожье": "Запоріжжя",
+    "сумах": "Суми", "суми": "Суми", "ужгороді": "Ужгород", "ужгород": "Ужгород",
+    "полтаві": "Полтава", "полтава": "Полтава", "вінниці": "Вінниця", "виннице": "Вінниця", "вінниця": "Вінниця",
+    "варшаві": "Варшава", "варшава": "Варшава", "будапешті": "Будапешт", "будапешт": "Будапешт",
+}
+WEATHER_CODES = {
+    0: "ясно", 1: "переважно ясно", 2: "мінлива хмарність", 3: "хмарно",
+    45: "туман", 48: "туман із памороззю", 51: "легка мряка", 53: "мряка", 55: "сильна мряка",
+    56: "крижана мряка", 57: "сильна крижана мряка", 61: "невеликий дощ", 63: "дощ", 65: "сильний дощ",
+    66: "крижаний дощ", 67: "сильний крижаний дощ", 71: "невеликий сніг", 73: "сніг", 75: "сильний сніг",
+    77: "снігові зерна", 80: "короткочасний дощ", 81: "зливи", 82: "сильні зливи",
+    85: "снігові заряди", 86: "сильні снігові заряди", 95: "гроза", 96: "гроза з градом", 99: "сильна гроза з градом",
+}
 
 
-def call_with_fallback(models, operation_name, operation):
-    last_error = None
+def clean_text(text):
+    text = (text or "").strip()
+    text = re.sub(r"^\s*(Відповідь|Jarvis|Текст)\s*:\s*", "", text, flags=re.I)
+    return text[:1800].strip()
 
-    for index, model in enumerate(models):
-        try:
-            log.info("%s: trying %s", operation_name, model)
 
-            result = operation(model)
+def history_text():
+    with history_lock:
+        return "\n".join(f"{role}: {text}" for role, text in history) or "Історія поки порожня."
 
-            log.info("%s: success with %s", operation_name, model)
-            return result
 
-        except Exception as error:
-            last_error = error
+def save_turn(question, answer):
+    with history_lock:
+        history.append(("Користувач", question[:500]))
+        history.append(("Jarvis", answer[:900]))
 
-            log.exception(
-                "%s failed with model %s",
-                operation_name,
-                model
-            )
 
-            # Do not waste time retrying invalid credentials
-            # or unsupported model names.
-            if not is_temporary_error(error):
-                if index == len(models) - 1:
-                    raise
-
-                # Try the next model. Some errors are model-specific.
-                continue
-
-            # Only one short retry across the fallback sequence.
-            # Avoid repeating a long wait for every model.
-            if index == 0:
-                time.sleep(0.5)
-
-    raise RuntimeError(
-        f"{operation_name} failed. Last error: {last_error}"
+def transcribe_audio(audio_bytes):
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=[
+            "Точно розпізнай мовлення в аудіо. Поверни лише слова користувача, без відповіді, вступу, лапок чи пояснень. Збережи мову оригіналу. Якщо неможливо розібрати, поверни [НЕРОЗБІРЛИВО].",
+            types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+        ],
+        config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=180),
     )
+    return clean_text(getattr(response, "text", ""))
 
 
-# =====================================================
-# ROUTES
-# =====================================================
+def weather_city_from_text(text):
+    low = text.lower()
+    for alias in sorted(CITY_ALIASES, key=len, reverse=True):
+        if alias in low:
+            return CITY_ALIASES[alias]
+    patterns = [
+        r"(?:погод\w*|температур\w*|прогноз\w*|дощ\w*|сніг\w*)\s+(?:у|в|для|на)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ'’ -]{2,45})",
+        r"\b(?:у|в|для|на)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ'’ -]{2,45})",
+        r"\b(?:in|at|for)\s+([A-Za-z -]{2,45})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, low, flags=re.I)
+        if match:
+            candidate = match.group(1).strip(" .,!?:;")
+            candidate = re.split(r"\b(сьогодні|завтра|зараз|на вихідних|today|tomorrow|now|буде)\b", candidate, maxsplit=1, flags=re.I)[0].strip()
+            if len(candidate) >= 2:
+                return candidate[:45]
+    return "Кривий Ріг"
 
-@app.route("/")
-def home():
-    return "JARVIS SERVER OK"
+
+def get_weather(city):
+    geo_response = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": city, "count": 5, "language": "uk", "format": "json"}, timeout=10,
+    )
+    geo_response.raise_for_status()
+    places = geo_response.json().get("results") or []
+    if not places:
+        raise ValueError(f"Не знайдено місто: {city}")
+    place = next((p for p in places if p.get("country_code") == "UA"), places[0])
+    response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": place["latitude"], "longitude": place["longitude"],
+            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "forecast_days": 2, "timezone": place.get("timezone") or "auto",
+        }, timeout=12,
+    )
+    response.raise_for_status()
+    data = response.json()
+    daily = data.get("daily", {})
+    def day_value(key, idx):
+        values = daily.get(key) or []
+        return values[idx] if len(values) > idx else None
+    return {
+        "place": f"{place.get('name', city)}, {place.get('country', '')}",
+        "current": data.get("current", {}),
+        "today": {"min": day_value("temperature_2m_min", 0), "max": day_value("temperature_2m_max", 0), "rain": day_value("precipitation_probability_max", 0)},
+        "tomorrow": {"code": day_value("weather_code", 1), "min": day_value("temperature_2m_min", 1), "max": day_value("temperature_2m_max", 1), "rain": day_value("precipitation_probability_max", 1)},
+    }
 
 
-@app.route("/health")
+def answer_with_weather(question, weather):
+    cur, today, tomorrow = weather["current"], weather["today"], weather["tomorrow"]
+    facts = (
+        f"Місто: {weather['place']}. Зараз: {cur.get('temperature_2m')}°C, {WEATHER_CODES.get(cur.get('weather_code'), 'умови не визначені')}; "
+        f"відчувається як {cur.get('apparent_temperature')}°C; вологість {cur.get('relative_humidity_2m')}%; "
+        f"вітер {cur.get('wind_speed_10m')} км/год. Сьогодні: мінімум {today['min']}°C, максимум {today['max']}°C, "
+        f"імовірність опадів до {today['rain']}%. Завтра: {WEATHER_CODES.get(tomorrow['code'], 'умови не визначені')}, "
+        f"від {tomorrow['min']} до {tomorrow['max']}°C, імовірність опадів до {tomorrow['rain']}%."
+    )
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=SYSTEM_PROMPT + "\nАктуальні дані погоди із сервісу (не змінюй числа й не вигадуй деталей):\n" + facts + "\nІсторія:\n" + history_text() + "\nЗапитання: " + question + "\nДай коротку природну відповідь українською.",
+        config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=160),
+    )
+    return clean_text(getattr(response, "text", ""))
+
+
+def answer_question(question):
+    prompt = SYSTEM_PROMPT + "\nІсторія попередньої розмови:\n" + history_text() + "\nНове запитання користувача:\n" + question + "\nВідповідай саме на нове запитання. Для актуальної інформації скористайся Google Search."
+    interaction = client.interactions.create(model=MODEL, input=prompt, tools=[{"type": "google_search"}])
+    return clean_text(getattr(interaction, "output_text", ""))
+
+
+def synthesize_speech(text):
+    interaction = client.interactions.create(
+        model=TTS_MODEL,
+        input=[{"type": "user_input", "content": [{
+            "type": "text", "text": text,
+            "annotations": [{"type": "speech_metadata", "style": "natural, clear, friendly Ukrainian speech at a moderate pace"}],
+        }]}],
+        response_format={"type": "audio"},
+        generation_config={"speech_config": [{"voice": TTS_VOICE}]},
+    )
+    audio = getattr(getattr(interaction, "output_audio", None), "data", None)
+    if not audio:
+        raise RuntimeError("Gemini TTS returned no audio")
+    wav = base64.b64decode(audio)
+    if not wav.startswith(b"RIFF") or wav[8:12] != b"WAVE":
+        raise RuntimeError("Gemini TTS did not return WAV audio")
+    return wav
+
+
+@app.get("/")
+def index():
+    return "Jarvis server is running.", 200
+
+
+@app.get("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "service": "jarvis",
-    })
+    return jsonify({"ok": True, "model": MODEL, "tts_model": TTS_MODEL, "search": "Google Search grounding", "weather": "Open-Meteo"}), 200
 
 
-# =====================================================
-# VOICE
-# =====================================================
-
-@app.route("/voice", methods=["POST"])
+@app.post("/voice")
 def voice():
-    started = time.monotonic()
-    stage = "receive"
-
+    started = time.time()
     try:
-        # ---------------------------------------------
-        # 1. RECEIVE WAV FROM ESP32
-        # ---------------------------------------------
-
         audio = request.get_data(cache=False)
+        if not audio or len(audio) <= 44:
+            return jsonify({"ok": False, "error": "Empty or invalid WAV audio"}), 400
+        if not audio.startswith(b"RIFF") or audio[8:12] != b"WAVE":
+            return jsonify({"ok": False, "error": "Expected WAV audio"}), 400
+        log.info("Received WAV audio: %d bytes", len(audio))
+        question = transcribe_audio(audio)
+        log.info("Recognized speech: %s", question[:300])
 
-        log.info("Received audio: %s bytes", len(audio))
+        if not question or "[НЕРОЗБІРЛИВО]" in question.upper():
+            answer = "Я не зовсім розібрав запитання. Будь ласка, повтори його трохи чіткіше."
+            save_turn("[мовлення не розібрано]", answer)
+        else:
+            try:
+                if any(word in question.lower() for word in WEATHER_WORDS):
+                    try:
+                        weather = get_weather(weather_city_from_text(question))
+                        answer = answer_with_weather(question, weather)
+                    except Exception as weather_error:
+                        log.warning("Weather lookup failed: %s", weather_error)
+                        answer = answer_question(question + "\nЗнайди актуальні дані погоди через Google Search. Не вигадуй їх, якщо не можеш перевірити.")
+                else:
+                    answer = answer_question(question)
+            except Exception:
+                log.exception("Gemini answer generation failed")
+                answer = "Вибач, зараз не вдалося отримати відповідь від Gemini. Спробуй ще раз трохи пізніше."
+            if not answer:
+                answer = "Я не зміг сформувати відповідь. Спробуй, будь ласка, запитати інакше."
+            save_turn(question, answer)
 
-        if len(audio) < 44:
-            return jsonify({
-                "ok": False,
-                "stage": stage,
-                "error": "Audio is missing or too small",
-            }), 400
-
-        # ---------------------------------------------
-        # 2. PREPARE AUDIO INLINE
-        # ---------------------------------------------
-
-        stage = "understanding"
-
-        audio_part = types.Part.from_bytes(
-            data=audio,
-            mime_type="audio/wav",
-        )
-
-        del audio
-
-        previous = "\n".join(
-            f"{role}: {text}"
-            for role, text in history
-        )
-
-        prompt = f"""
-{SYSTEM_PROMPT}
-
-Попередня розмова:
-{previous if previous else "(це початок розмови)"}
-
-Прослухай прикріплений аудіозапис.
-Визнач, що саме сказав користувач, і дай відповідь
-на його запитання або виконай словесну інструкцію.
-Якщо слова незрозумілі, коротко попроси повторити.
-"""
-
-        # ---------------------------------------------
-        # 3. GENERATE TEXT ANSWER
-        # ---------------------------------------------
-
-        def generate_answer(model):
-            return client.models.generate_content(
-                model=model,
-                contents=[audio_part, prompt],
-                config=types.GenerateContentConfig(
-                    temperature=0.4,
-                    max_output_tokens=180,
-                ),
-            )
-
-        response = call_with_fallback(
-            TEXT_MODELS,
-            "VOICE UNDERSTANDING",
-            generate_answer,
-        )
-
-        answer = (response.text or "").strip()
-
-        if not answer:
-            raise RuntimeError("Gemini returned an empty answer")
-
-        log.info("Answer generated in %.2f seconds",
-                 time.monotonic() - started)
-
-        # Store the last exchange for follow-up questions.
-        history.append(("Користувач", "[голосове запитання]"))
-        history.append(("Jarvis", answer))
-
-        # ---------------------------------------------
-        # 4. GENERATE MALE VOICE
-        # ---------------------------------------------
-
-        stage = "tts"
-
-        def generate_speech(model):
-            return client.interactions.create(
-                model=model,
-                input=answer,
-                response_format={"type": "audio"},
-                generation_config={
-                    "speech_config": [
-                        {"voice": "Charon"}
-                    ]
-                },
-            )
-
-        tts = call_with_fallback(
-            TTS_MODELS,
-            "TEXT TO SPEECH",
-            generate_speech,
-        )
-
-        encoded_audio = tts.output_audio.data
-
-        if not encoded_audio:
-            raise RuntimeError("TTS returned no audio")
-
-        # Gemini Interactions API returns base64 audio data.
-        audio_out = base64.b64decode(encoded_audio)
-
-        if len(audio_out) < 44:
-            raise RuntimeError("Generated audio is too small")
-
-        log.info(
-            "Returning %s bytes; total time %.2f seconds",
-            len(audio_out),
-            time.monotonic() - started,
-        )
-
-        # ---------------------------------------------
-        # 5. RETURN AUDIO TO ESP32
-        # ---------------------------------------------
-
-        return Response(
-            audio_out,
-            status=200,
-            mimetype="audio/wav",
-            headers={
-                "Cache-Control": "no-store",
-                "X-Jarvis-Status": "ok",
-            },
-        )
-
-    except Exception as error:
-        log.exception(
-            "JARVIS ERROR at stage %s",
-            stage,
-        )
-
-        return jsonify({
-            "ok": False,
-            "stage": stage,
-            "error": str(error),
-        }), 500
+        log.info("Answer prepared in %.1f sec", time.time() - started)
+        try:
+            wav = synthesize_speech(answer)
+        except Exception:
+            log.exception("Gemini speech generation failed")
+            wav = synthesize_speech("Вибач, зараз у мене проблема з голосовою відповіддю. Спробуй ще раз.")
+        return Response(wav, status=200, mimetype="audio/wav", headers={"Cache-Control": "no-store"})
+    except Exception:
+        log.exception("Voice endpoint failed")
+        return jsonify({"ok": False, "error": "Voice processing failed"}), 500
 
 
-# =====================================================
-# START
-# =====================================================
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({"ok": False, "error": "Audio is too large"}), 413
+
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000")),
-    )
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
