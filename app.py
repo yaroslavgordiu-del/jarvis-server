@@ -1,17 +1,22 @@
 import os
 import time
-import tempfile
 import base64
-import gc
+import logging
+from collections import deque
 
 from flask import Flask, request, jsonify, Response
 from google import genai
+from google.genai import types
+
+# =====================================================
+# JARVIS SERVER
+# =====================================================
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
-# =====================================================
-# GEMINI CLIENT
-# =====================================================
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("jarvis")
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -20,34 +25,45 @@ if not API_KEY:
 
 client = genai.Client(api_key=API_KEY)
 
-# Primary and fallback models for understanding speech.
+# Fast model first, with fallbacks.
 TEXT_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
 ]
 
-# Primary and fallback models for generating speech.
 TTS_MODELS = [
-    "gemini-3.8-flash-tts",
     "gemini-3.8-flash-lite-tts",
+    "gemini-3.8-flash-tts",
 ]
 
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+# Short conversation memory for this single Jarvis device.
+history = deque(maxlen=8)
 
+SYSTEM_PROMPT = """
+Ти — Jarvis, розумний домашній голосовий помічник.
+
+Правила спілкування:
+- Відповідай українською, якщо користувач говорить українською.
+- Спілкуйся природно, дружньо та впевнено.
+- Не повторюй запитання користувача без потреби.
+- На прості запитання відповідай коротко.
+- На складні запитання пояснюй докладніше.
+- Враховуй попередні репліки, якщо вони стосуються поточного питання.
+- Не вигадуй актуальну погоду, новини, ціни або інші дані.
+- Якщо не знаєш відповіді, чесно скажи про це.
+- Не розповідай про аналіз аудіофайлів і внутрішню технічну роботу.
+- Формулюй відповідь так, щоб її було приємно слухати через динамік.
+"""
 
 # =====================================================
-# RETRY HELPERS
+# RETRIES
 # =====================================================
 
 def is_temporary_error(error):
-    """
-    Detect temporary capacity errors and rate limits.
-    """
-
     message = str(error).upper()
 
-    temporary_markers = [
+    markers = [
         "503",
         "UNAVAILABLE",
         "HIGH DEMAND",
@@ -64,90 +80,51 @@ def is_temporary_error(error):
         "TIMEOUT",
     ]
 
-    return any(
-        marker in message
-        for marker in temporary_markers
-    )
+    return any(marker in message for marker in markers)
 
 
-def call_with_fallback(model_names, operation_name, operation):
-    """
-    Try each model in order.
-    Retry temporary errors with short pauses.
-    """
-
+def call_with_fallback(models, operation_name, operation):
     last_error = None
 
-    for model_index, model_name in enumerate(model_names):
+    for index, model in enumerate(models):
+        try:
+            log.info("%s: trying %s", operation_name, model)
 
-        # Two attempts per model, with a short pause.
-        for attempt in range(2):
+            result = operation(model)
 
-            try:
-                print(
-                    f"{operation_name}: "
-                    f"model={model_name}, "
-                    f"attempt={attempt + 1}",
-                    flush=True
-                )
+            log.info("%s: success with %s", operation_name, model)
+            return result
 
-                result = operation(model_name)
+        except Exception as error:
+            last_error = error
 
-                print(
-                    f"{operation_name} SUCCESS: {model_name}",
-                    flush=True
-                )
-
-                return result
-
-            except Exception as error:
-
-                last_error = error
-
-                print(
-                    f"{operation_name} ERROR: "
-                    f"model={model_name}, "
-                    f"attempt={attempt + 1}, "
-                    f"error={repr(error)}",
-                    flush=True
-                )
-
-                # Do not retry permanent errors such as
-                # invalid model names or invalid API keys.
-                if not is_temporary_error(error):
-                    raise
-
-                # Wait before retrying the same model.
-                if attempt == 0:
-                    delay = 2
-
-                    print(
-                        f"Temporary error. "
-                        f"Retrying in {delay} seconds.",
-                        flush=True
-                    )
-
-                    time.sleep(delay)
-
-        # Move to the next model after both attempts fail.
-        if model_index < len(model_names) - 1:
-
-            print(
-                f"{model_name} unavailable. "
-                f"Switching to fallback model.",
-                flush=True
+            log.exception(
+                "%s failed with model %s",
+                operation_name,
+                model
             )
 
-            gc.collect()
+            # Do not waste time retrying invalid credentials
+            # or unsupported model names.
+            if not is_temporary_error(error):
+                if index == len(models) - 1:
+                    raise
+
+                # Try the next model. Some errors are model-specific.
+                continue
+
+            # Only one short retry across the fallback sequence.
+            # Avoid repeating a long wait for every model.
+            if index == 0:
+                time.sleep(0.5)
 
     raise RuntimeError(
-        f"All {operation_name} models failed. "
-        f"Last error: {repr(last_error)}"
+        f"{operation_name} failed. Last error: {last_error}"
     )
 
 
 # =====================================================
-# HOME
+# ROUTES
 # =====================================================
 
 @app.route("/")
@@ -155,210 +132,145 @@ def home():
     return "JARVIS SERVER OK"
 
 
+@app.route("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "service": "jarvis",
+    })
+
+
 # =====================================================
-# VOICE ENDPOINT
+# VOICE
 # =====================================================
 
 @app.route("/voice", methods=["POST"])
 def voice():
-
-    audio_path = None
-    uploaded_file = None
+    started = time.monotonic()
+    stage = "receive"
 
     try:
-
         # ---------------------------------------------
-        # 1. RECEIVE AUDIO FROM ESP32
+        # 1. RECEIVE WAV FROM ESP32
         # ---------------------------------------------
 
         audio = request.get_data(cache=False)
 
-        audio_size = len(audio)
+        log.info("Received audio: %s bytes", len(audio))
 
-        print(
-            "RECEIVED AUDIO:",
-            audio_size,
-            "bytes",
-            flush=True
+        if len(audio) < 44:
+            return jsonify({
+                "ok": False,
+                "stage": stage,
+                "error": "Audio is missing or too small",
+            }), 400
+
+        # ---------------------------------------------
+        # 2. PREPARE AUDIO INLINE
+        # ---------------------------------------------
+
+        stage = "understanding"
+
+        audio_part = types.Part.from_bytes(
+            data=audio,
+            mime_type="audio/wav",
         )
-
-        if not audio:
-            return jsonify({
-                "ok": False,
-                "stage": "receive",
-                "error": "No audio received"
-            }), 400
-
-        if audio_size < 44:
-            return jsonify({
-                "ok": False,
-                "stage": "receive",
-                "error": "Audio file is too small"
-            }), 400
-
-        # ---------------------------------------------
-        # 2. SAVE TEMPORARY WAV
-        # ---------------------------------------------
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".wav",
-            delete=False
-        ) as file:
-
-            audio_path = file.name
-            file.write(audio)
 
         del audio
-        gc.collect()
 
-        print("WAV SAVED", flush=True)
-
-        # ---------------------------------------------
-        # 3. UPLOAD AUDIO TO GEMINI
-        # ---------------------------------------------
-
-        print("UPLOADING AUDIO TO GEMINI", flush=True)
-
-        uploaded_file = client.files.upload(
-            file=audio_path
+        previous = "\n".join(
+            f"{role}: {text}"
+            for role, text in history
         )
 
-        print(
-            "AUDIO UPLOADED TO GEMINI",
-            flush=True
-        )
+        prompt = f"""
+{SYSTEM_PROMPT}
 
-        # ---------------------------------------------
-        # 4. UNDERSTAND THE USER'S VOICE
-        # ---------------------------------------------
+Попередня розмова:
+{previous if previous else "(це початок розмови)"}
 
-        prompt = """
-Ти — Джарвіс, домашній голосовий AI-помічник.
-
-Користувач говорить українською мовою.
-
-Зрозумій його голосовий запит і дай коротку,
-корисну відповідь українською мовою.
-
-Відповідь повинна бути природною та короткою,
-оскільки її буде озвучено через динамік.
-
-Не описуй аудіофайл.
-Не говори про аналіз файлу.
-Не пояснюй внутрішні технічні процеси.
-
-Якщо користувача неможливо зрозуміти, відповідай:
-«Не почув. Повтори, будь ласка».
+Прослухай прикріплений аудіозапис.
+Визнач, що саме сказав користувач, і дай відповідь
+на його запитання або виконай словесну інструкцію.
+Якщо слова незрозумілі, коротко попроси повторити.
 """
 
-        def generate_answer(model_name):
+        # ---------------------------------------------
+        # 3. GENERATE TEXT ANSWER
+        # ---------------------------------------------
 
+        def generate_answer(model):
             return client.models.generate_content(
-                model=model_name,
-                contents=[
-                    uploaded_file,
-                    prompt
-                ]
+                model=model,
+                contents=[audio_part, prompt],
+                config=types.GenerateContentConfig(
+                    temperature=0.4,
+                    max_output_tokens=180,
+                ),
             )
 
         response = call_with_fallback(
             TEXT_MODELS,
             "VOICE UNDERSTANDING",
-            generate_answer
+            generate_answer,
         )
 
         answer = (response.text or "").strip()
 
-        del response
-        gc.collect()
-
-        print(
-            "GEMINI ANSWER:",
-            answer,
-            flush=True
-        )
-
         if not answer:
-            return jsonify({
-                "ok": False,
-                "stage": "understanding",
-                "error": "Gemini returned an empty answer"
-            }), 502
+            raise RuntimeError("Gemini returned an empty answer")
+
+        log.info("Answer generated in %.2f seconds",
+                 time.monotonic() - started)
+
+        # Store the last exchange for follow-up questions.
+        history.append(("Користувач", "[голосове запитання]"))
+        history.append(("Jarvis", answer))
 
         # ---------------------------------------------
-        # 5. CONVERT THE ANSWER TO SPEECH
+        # 4. GENERATE MALE VOICE
         # ---------------------------------------------
 
-        print("STARTING TTS", flush=True)
+        stage = "tts"
 
-        def generate_speech(model_name):
-
+        def generate_speech(model):
             return client.interactions.create(
-                model=model_name,
+                model=model,
                 input=answer,
-                response_format={
-                    "type": "audio"
-                },
+                response_format={"type": "audio"},
                 generation_config={
                     "speech_config": [
-                        {
-                            "voice": "Kore"
-                        }
+                        {"voice": "Charon"}
                     ]
-                }
+                },
             )
 
         tts = call_with_fallback(
             TTS_MODELS,
             "TEXT TO SPEECH",
-            generate_speech
+            generate_speech,
         )
-
-        print("TTS GENERATED", flush=True)
-
-        # ---------------------------------------------
-        # 6. EXTRACT THE AUDIO
-        # ---------------------------------------------
 
         encoded_audio = tts.output_audio.data
 
         if not encoded_audio:
-            return jsonify({
-                "ok": False,
-                "stage": "tts",
-                "error": "TTS returned no audio data"
-            }), 502
+            raise RuntimeError("TTS returned no audio")
 
-        audio_out = base64.b64decode(
-            encoded_audio
-        )
-
-        del tts
-        del encoded_audio
-        gc.collect()
+        # Gemini Interactions API returns base64 audio data.
+        audio_out = base64.b64decode(encoded_audio)
 
         if len(audio_out) < 44:
-            return jsonify({
-                "ok": False,
-                "stage": "tts",
-                "error": "Generated audio is too small"
-            }), 502
+            raise RuntimeError("Generated audio is too small")
 
-        print(
-            "TTS AUDIO SIZE:",
+        log.info(
+            "Returning %s bytes; total time %.2f seconds",
             len(audio_out),
-            "bytes",
-            flush=True
+            time.monotonic() - started,
         )
 
         # ---------------------------------------------
-        # 7. RETURN AUDIO TO ESP32
+        # 5. RETURN AUDIO TO ESP32
         # ---------------------------------------------
-
-        print(
-            "RETURNING AUDIO TO ESP32",
-            flush=True
-        )
 
         return Response(
             audio_out,
@@ -366,57 +278,30 @@ def voice():
             mimetype="audio/wav",
             headers={
                 "Cache-Control": "no-store",
-                "X-Jarvis-Status": "ok"
-            }
+                "X-Jarvis-Status": "ok",
+            },
         )
 
     except Exception as error:
-
-        print(
-            "JARVIS ERROR:",
-            repr(error),
-            flush=True
+        log.exception(
+            "JARVIS ERROR at stage %s",
+            stage,
         )
 
         return jsonify({
             "ok": False,
-            "error": str(error)
+            "stage": stage,
+            "error": str(error),
         }), 500
-
-    finally:
-
-        # ---------------------------------------------
-        # 8. CLEANUP
-        # ---------------------------------------------
-
-        if audio_path:
-
-            try:
-                os.remove(audio_path)
-
-                print(
-                    "TEMP WAV DELETED",
-                    flush=True
-                )
-
-            except Exception as error:
-
-                print(
-                    "TEMP FILE CLEANUP ERROR:",
-                    repr(error),
-                    flush=True
-                )
-
-        gc.collect()
 
 
 # =====================================================
-# START SERVER
+# START
 # =====================================================
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
-        port=10000
+        port=int(os.environ.get("PORT", "10000")),
+    )    port=10000
     )
