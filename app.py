@@ -25,6 +25,13 @@ client = genai.Client(api_key=API_KEY)
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Charon")
+# If a model is temporarily overloaded (503/UNAVAILABLE), try stable alternatives.
+TEXT_MODEL_FALLBACKS = list(dict.fromkeys([
+    MODEL, "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"
+]))
+TTS_MODEL_FALLBACKS = list(dict.fromkeys([
+    TTS_MODEL, "gemini-3.8-flash-lite-tts", "gemini-3.1-flash-tts-preview"
+]))
 
 # Short-term conversation memory; it resets when Render restarts the service.
 history = deque(maxlen=12)
@@ -67,6 +74,57 @@ WEATHER_CODES = {
 }
 
 
+def _is_temporary_or_model_error(exc):
+    message = str(exc).lower()
+    return any(token in message for token in (
+        "503", "unavailable", "high demand", "overloaded", "429", "resource_exhausted",
+        "500", "internal error", "502", "504", "not found", "404", "model is not found"
+    ))
+
+
+def generate_content_with_fallback(*, contents, config=None):
+    last_error = None
+    for model_name in TEXT_MODEL_FALLBACKS:
+        for attempt in range(2):
+            try:
+                if config is None:
+                    return client.models.generate_content(model=model_name, contents=contents)
+                return client.models.generate_content(model=model_name, contents=contents, config=config)
+            except Exception as exc:
+                last_error = exc
+                if not _is_temporary_or_model_error(exc):
+                    raise
+                log.warning("Gemini model %s failed (attempt %s): %s", model_name, attempt + 1, exc)
+                time.sleep(1.5 * (attempt + 1))
+                break
+    raise last_error
+
+
+def interaction_with_fallback(*, input, tools=None, response_format=None, generation_config=None):
+    last_error = None
+    for model_name in (TTS_MODEL_FALLBACKS if response_format else TEXT_MODEL_FALLBACKS):
+        for attempt in range(2):
+            try:
+                kwargs = {"model": model_name, "input": input}
+                if tools is not None:
+                    kwargs["tools"] = tools
+                if response_format is not None:
+                    kwargs["response_format"] = response_format
+                if generation_config is not None:
+                    kwargs["generation_config"] = generation_config
+                result = client.interactions.create(**kwargs)
+                log.info("Gemini interaction succeeded with model %s", model_name)
+                return result
+            except Exception as exc:
+                last_error = exc
+                if not _is_temporary_or_model_error(exc):
+                    raise
+                log.warning("Gemini interaction model %s failed (attempt %s): %s", model_name, attempt + 1, exc)
+                time.sleep(1.5 * (attempt + 1))
+                break
+    raise last_error
+
+
 def clean_text(text):
     text = (text or "").strip()
     text = re.sub(r"^\s*(Відповідь|Jarvis|Текст)\s*:\s*", "", text, flags=re.I)
@@ -85,8 +143,7 @@ def save_turn(question, answer):
 
 
 def transcribe_audio(audio_bytes):
-    response = client.models.generate_content(
-        model=MODEL,
+    response = generate_content_with_fallback(
         contents=[
             "Точно розпізнай мовлення в аудіо. Поверни лише слова користувача, без відповіді, вступу, лапок чи пояснень. Збережи мову оригіналу. Якщо неможливо розібрати, поверни [НЕРОЗБІРЛИВО].",
             types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
@@ -158,8 +215,7 @@ def answer_with_weather(question, weather):
         f"імовірність опадів до {today['rain']}%. Завтра: {WEATHER_CODES.get(tomorrow['code'], 'умови не визначені')}, "
         f"від {tomorrow['min']} до {tomorrow['max']}°C, імовірність опадів до {tomorrow['rain']}%."
     )
-    response = client.models.generate_content(
-        model=MODEL,
+    response = generate_content_with_fallback(
         contents=SYSTEM_PROMPT + "\nАктуальні дані погоди із сервісу (не змінюй числа й не вигадуй деталей):\n" + facts + "\nІсторія:\n" + history_text() + "\nЗапитання: " + question + "\nДай коротку природну відповідь українською.",
         config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=160),
     )
@@ -168,13 +224,12 @@ def answer_with_weather(question, weather):
 
 def answer_question(question):
     prompt = SYSTEM_PROMPT + "\nІсторія попередньої розмови:\n" + history_text() + "\nНове запитання користувача:\n" + question + "\nВідповідай саме на нове запитання. Для актуальної інформації скористайся Google Search."
-    interaction = client.interactions.create(model=MODEL, input=prompt, tools=[{"type": "google_search"}])
+    interaction = interaction_with_fallback(input=prompt, tools=[{"type": "google_search"}])
     return clean_text(getattr(interaction, "output_text", ""))
 
 
 def synthesize_speech(text):
-    interaction = client.interactions.create(
-        model=TTS_MODEL,
+    interaction = interaction_with_fallback(
         input=[{"type": "user_input", "content": [{
             "type": "text", "text": text,
             "annotations": [{"type": "speech_metadata", "style": "natural, clear, friendly Ukrainian speech at a moderate pace"}],
@@ -213,6 +268,48 @@ def voice():
         log.info("Received WAV audio: %d bytes", len(audio))
         question = transcribe_audio(audio)
         log.info("Recognized speech: %s", question[:300])
+
+        if not question or "[НЕРОЗБІРЛИВО]" in question.upper():
+            answer = "Я не зовсім розібрав запитання. Будь ласка, повтори його трохи чіткіше."
+            save_turn("[мовлення не розібрано]", answer)
+        else:
+            try:
+                if any(word in question.lower() for word in WEATHER_WORDS):
+                    try:
+                        weather = get_weather(weather_city_from_text(question))
+                        answer = answer_with_weather(question, weather)
+                    except Exception as weather_error:
+                        log.warning("Weather lookup failed: %s", weather_error)
+                        answer = answer_question(question + "\nЗнайди актуальні дані погоди через Google Search. Не вигадуй їх, якщо не можеш перевірити.")
+                else:
+                    answer = answer_question(question)
+            except Exception:
+                log.exception("Gemini answer generation failed")
+                answer = "Вибач, зараз не вдалося отримати відповідь від Gemini. Спробуй ще раз трохи пізніше."
+            if not answer:
+                answer = "Я не зміг сформувати відповідь. Спробуй, будь ласка, запитати інакше."
+            save_turn(question, answer)
+
+        log.info("Answer prepared in %.1f sec", time.time() - started)
+        try:
+            wav = synthesize_speech(answer)
+        except Exception:
+            log.exception("Gemini speech generation failed")
+            wav = synthesize_speech("Вибач, зараз у мене проблема з голосовою відповіддю. Спробуй ще раз.")
+        return Response(wav, status=200, mimetype="audio/wav", headers={"Cache-Control": "no-store"})
+    except Exception:
+        log.exception("Voice endpoint failed")
+        return jsonify({"ok": False, "error": "Voice processing failed"}), 500
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({"ok": False, "error": "Audio is too large"}), 413
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+question[:300])
 
         if not question or "[НЕРОЗБІРЛИВО]" in question.upper():
             answer = "Я не зовсім розібрав запитання. Будь ласка, повтори його трохи чіткіше."
