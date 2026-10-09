@@ -223,6 +223,116 @@ def answer_with_weather(question, weather):
 
 
 def answer_question(question):
+    prompt = (
+        SYSTEM_PROMPT
+        + "\nІсторія попередньої розмови:\n" + history_text()
+        + "\nНове запитання користувача:\n" + question
+        + "\nВідповідай саме на нове запитання, не повторюй його. "
+          "Для актуальних фактів, новин, цін або подій використовуй Google Search."
+    )
+    # Use the stable GenerateContent endpoint for text + Google Search grounding.
+    # The previous Interactions text call was returning HTTP 429 and delaying the ESP32.
+    search_tool = types.Tool(google_search=types.GoogleSearch())
+    config = types.GenerateContentConfig(
+        temperature=0.35,
+        max_output_tokens=220,
+        tools=[search_tool],
+    )
+    response = generate_content_with_fallback(contents=prompt, config=config)
+    return clean_text(getattr(response, "text", ""))
+
+
+def synthesize_speech(text):
+    interaction = interaction_with_fallback(
+        input=[{"type": "user_input", "content": [{
+            "type": "text", "text": text,
+            "annotations": [{"type": "speech_metadata", "style": "natural, clear, friendly Ukrainian speech at a moderate pace"}],
+        }]}],
+        response_format={"type": "audio"},
+        generation_config={"speech_config": [{"voice": TTS_VOICE}]},
+    )
+    audio = getattr(getattr(interaction, "output_audio", None), "data", None)
+    if not audio:
+        raise RuntimeError("Gemini TTS returned no audio")
+    wav = base64.b64decode(audio)
+    if not wav.startswith(b"RIFF") or wav[8:12] != b"WAVE":
+        raise RuntimeError("Gemini TTS did not return WAV audio")
+    return wav
+
+
+@app.get("/")
+def index():
+    return "Jarvis server is running.", 200
+
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "model": MODEL, "tts_model": TTS_MODEL, "search": "Google Search grounding", "weather": "Open-Meteo"}), 200
+
+
+@app.post("/voice")
+def voice():
+    started = time.time()
+    try:
+        audio = request.get_data(cache=False)
+        if not audio or len(audio) <= 44:
+            return jsonify({"ok": False, "error": "Empty or invalid WAV audio"}), 400
+        if not audio.startswith(b"RIFF") or audio[8:12] != b"WAVE":
+            return jsonify({"ok": False, "error": "Expected WAV audio"}), 400
+        log.info("Received WAV audio: %d bytes", len(audio))
+        question = transcribe_audio(audio)
+        log.info("Recognized speech: %s", question[:300])
+
+        if not question or "[НЕРОЗБІРЛИВО]" in question.upper():
+            answer = "Я не зовсім розібрав запитання. Будь ласка, повтори його трохи чіткіше."
+            save_turn("[мовлення не розібрано]", answer)
+        else:
+            try:
+                if any(word in question.lower() for word in WEATHER_WORDS):
+                    try:
+                        weather = get_weather(weather_city_from_text(question))
+                        answer = answer_with_weather(question, weather)
+                    except Exception as weather_error:
+                        log.warning("Weather lookup failed: %s", weather_error)
+                        answer = answer_question(question + "\nЗнайди актуальні дані погоди через Google Search. Не вигадуй їх, якщо не можеш перевірити.")
+                else:
+                    answer = answer_question(question)
+            except Exception:
+                log.exception("Gemini answer generation failed")
+                answer = "Вибач, зараз не вдалося отримати відповідь від Gemini. Спробуй ще раз трохи пізніше."
+            if not answer:
+                answer = "Я не зміг сформувати відповідь. Спробуй, будь ласка, запитати інакше."
+            save_turn(question, answer)
+
+        log.info("Answer prepared in %.1f sec", time.time() - started)
+        try:
+            wav = synthesize_speech(answer)
+        except Exception:
+            log.exception("Gemini speech generation failed")
+            wav = synthesize_speech("Вибач, зараз у мене проблема з голосовою відповіддю. Спробуй ще раз.")
+        return Response(wav, status=200, mimetype="audio/wav", headers={"Cache-Control": "no-store"})
+    except Exception:
+        log.exception("Voice endpoint failed")
+        return jsonify({"ok": False, "error": "Voice processing failed"}), 500
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({"ok": False, "error": "Audio is too large"}), 413
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+ {tomorrow['min']} до {tomorrow['max']}°C, імовірність опадів до {tomorrow['rain']}%."
+    )
+    response = generate_content_with_fallback(
+        contents=SYSTEM_PROMPT + "\nАктуальні дані погоди із сервісу (не змінюй числа й не вигадуй деталей):\n" + facts + "\nІсторія:\n" + history_text() + "\nЗапитання: " + question + "\nДай коротку природну відповідь українською.",
+        config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=160),
+    )
+    return clean_text(getattr(response, "text", ""))
+
+
+def answer_question(question):
     prompt = SYSTEM_PROMPT + "\nІсторія попередньої розмови:\n" + history_text() + "\nНове запитання користувача:\n" + question + "\nВідповідай саме на нове запитання. Для актуальної інформації скористайся Google Search."
     interaction = interaction_with_fallback(input=prompt, tools=[{"type": "google_search"}])
     return clean_text(getattr(interaction, "output_text", ""))
