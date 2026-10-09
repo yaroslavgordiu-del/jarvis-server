@@ -12,7 +12,7 @@ client = genai.Client(
     api_key=os.environ.get("GEMINI_API_KEY")
 )
 
-MODEL = "gemini-3.8-flash"
+MODEL = "gemini-3.7-flash"
 TTS_MODEL = "gemini-3.8-flash-tts"
 
 
